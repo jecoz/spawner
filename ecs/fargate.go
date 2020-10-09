@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -18,33 +17,31 @@ import (
 const LastStatusPollInterval = time.Millisecond * time.Duration(500)
 
 type Fargate struct {
-	sess   *session.Session
-	client *ecs.ECS
+	HostVersion string
+	sess        *session.Session
+	client      *ecs.ECS
 }
 
-func (f *Fargate) lazySession() *session.Session {
-	if f.sess == nil {
-		f.sess = session.Must(session.NewSession())
+func NewFargate(hostVersion string) *Fargate {
+	sess := session.Must(session.NewSession())
+	return &Fargate{
+		HostVersion: hostVersion,
+		sess:        sess,
+		client:      ecs.New(sess),
 	}
-	return f.sess
 }
 
-func (f *Fargate) lazyClient() *ecs.ECS {
-	if f.client == nil {
-		f.client = ecs.New(f.lazySession())
-	}
-	return f.client
-}
+func (f *Fargate) Name() string { return "ecs.fargate-" + f.HostVersion }
 
-func (f *Fargate) DescribeTask(ctx context.Context, cluster, arn string) (*ecs.Task, error) {
+func (f *Fargate) describeTask(ctx context.Context, cluster, arn *string) (*ecs.Task, error) {
 	input := &ecs.DescribeTasksInput{
-		Cluster: stringPtr(cluster),
-		Tasks:   stringPtrSlice([]string{arn}),
+		Cluster: cluster,
+		Tasks:   []*string{arn},
 	}
 	if err := input.Validate(); err != nil {
 		return nil, err
 	}
-	resp, err := f.lazyClient().DescribeTasksWithContext(ctx, input)
+	resp, err := f.client.DescribeTasksWithContext(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +57,7 @@ func (f *Fargate) DescribeTask(ctx context.Context, cluster, arn string) (*ecs.T
 	return resp.Tasks[0], nil
 }
 
-func (f *Fargate) waitRunningTask(ctx context.Context, cluster, arn string) (task *ecs.Task, err error) {
+func (f *Fargate) waitRunningTask(ctx context.Context, cluster, arn *string) (task *ecs.Task, err error) {
 	// Stop when the context is invalidated or the response is no longer
 	// successfull. We're waiting a pending process to become running here,
 	// not to resume from a lost connection.
@@ -68,7 +65,7 @@ func (f *Fargate) waitRunningTask(ctx context.Context, cluster, arn string) (tas
 		timer := time.NewTimer(LastStatusPollInterval)
 		select {
 		case <-timer.C:
-			task, err = f.DescribeTask(ctx, cluster, arn)
+			task, err = f.describeTask(ctx, cluster, arn)
 			if err != nil {
 				return
 			}
@@ -87,30 +84,35 @@ func (f *Fargate) waitRunningTask(ctx context.Context, cluster, arn string) (tas
 	}
 }
 
-type RunTaskInput struct {
-	Cluster        string
-	TaskDefinition string
-	Subnets        []string
-	SecurityGroups []string
-}
-
-func (f *Fargate) RunTask(ctx context.Context, p RunTaskInput) (*ecs.Task, error) {
+func (f *Fargate) runTask(ctx context.Context, d TaskDefinition) (*ecs.Task, error) {
+	overrides := []*ecs.ContainerOverride{}
+	for _, v := range d.Overrides {
+		overrides = append(overrides, &ecs.ContainerOverride{
+			Name:    v.Name,
+			Command: v.Command,
+		})
+	}
+	lt := ecs.LaunchTypeFargate
+	apip := ecs.AssignPublicIpEnabled
 	input := &ecs.RunTaskInput{
-		Cluster:        stringPtr(p.Cluster),
-		LaunchType:     stringPtr(ecs.LaunchTypeFargate),
-		TaskDefinition: stringPtr(p.TaskDefinition),
+		TaskDefinition: d.Name,
+		Cluster:        d.Cluster,
+		LaunchType:     &lt,
 		NetworkConfiguration: &ecs.NetworkConfiguration{
 			AwsvpcConfiguration: &ecs.AwsVpcConfiguration{
-				AssignPublicIp: stringPtr(ecs.AssignPublicIpEnabled),
-				Subnets:        stringPtrSlice(p.Subnets),
-				SecurityGroups: stringPtrSlice(p.SecurityGroups),
+				AssignPublicIp: &apip,
+				Subnets:        d.Subnets,
+				SecurityGroups: d.SecurityGroups,
 			},
+		},
+		Overrides: &ecs.TaskOverride{
+			ContainerOverrides: overrides,
 		},
 	}
 	if err := input.Validate(); err != nil {
 		return nil, err
 	}
-	resp, err := f.lazyClient().RunTaskWithContext(ctx, input)
+	resp, err := f.client.RunTaskWithContext(ctx, input)
 	if err != nil {
 		return nil, err
 	}
@@ -120,27 +122,14 @@ func (f *Fargate) RunTask(ctx context.Context, p RunTaskInput) (*ecs.Task, error
 		}
 		return nil, fmt.Errorf("run task: unable to fulfil request")
 	}
-	// NOTE: it is possible to Run more than 1 task per call.
 	return resp.Tasks[0], nil
 }
 
-func (f *Fargate) StopTask(ctx context.Context, cluster, arn string) error {
-	input := &ecs.StopTaskInput{
-		Cluster: stringPtr(cluster),
-		Task:    stringPtr(arn),
-	}
-	if err := input.Validate(); err != nil {
-		return err
-	}
-	_, err := f.lazyClient().StopTaskWithContext(ctx, input)
-	return err
-}
-
-func describeNetworkInterface(ctx context.Context, sess *session.Session, eni string) (*ec2.NetworkInterface, error) {
+func describeNetworkInterface(ctx context.Context, sess *session.Session, eni *string) (*ec2.NetworkInterface, error) {
 	// NOTE: this function uses EC2. If more functions like this are needed,
 	// extract them into a separte ec2 package.
 	input := &ec2.DescribeNetworkInterfacesInput{
-		NetworkInterfaceIds: stringPtrSlice([]string{eni}),
+		NetworkInterfaceIds: []*string{eni},
 	}
 	if err := input.Validate(); err != nil {
 		return nil, err
@@ -155,9 +144,9 @@ func describeNetworkInterface(ctx context.Context, sess *session.Session, eni st
 	return resp.NetworkInterfaces[0], nil
 }
 
-func eniFromTask(task *ecs.Task) (string, error) {
+func eniFromTask(task *ecs.Task) (*string, error) {
 	if len(task.Attachments) == 0 {
-		return "", fmt.Errorf("missing task attachments")
+		return nil, fmt.Errorf("missing task attachments")
 	}
 	var eniAttach *ecs.Attachment
 	for i, v := range task.Attachments {
@@ -167,32 +156,27 @@ func eniFromTask(task *ecs.Task) (string, error) {
 		}
 	}
 	if eniAttach == nil {
-		return "", fmt.Errorf("missing ElasticNetworkInterface attachment")
+		return nil, fmt.Errorf("missing ElasticNetworkInterface attachment")
 	}
-	var eni string
+	var eni *string
 	for _, v := range eniAttach.Details {
 		if *v.Name == "networkInterfaceId" {
-			eni = *v.Value
+			eni = v.Value
 			break
 		}
 	}
-	if eni == "" {
-		return "", fmt.Errorf("unable to find network interface id within eni attachment")
+	if eni == nil || *eni == "" {
+		return nil, fmt.Errorf("unable to find network interface id within eni attachment")
 	}
 	return eni, nil
 }
 
 func (f *Fargate) Spawn(ctx context.Context, r io.Reader) (*spawner.World, error) {
-	var t Task
-	if err := json.NewDecoder(r).Decode(&t); err != nil {
+	var d TaskDefinition
+	if err := json.NewDecoder(r).Decode(&d); err != nil {
 		return nil, fmt.Errorf("decoding task: %w", err)
 	}
-	task, err := f.RunTask(ctx, RunTaskInput{
-		Cluster:        t.Definition.Cluster,
-		TaskDefinition: t.Definition.TaskDefinition,
-		Subnets:        t.Definition.Subnets,
-		SecurityGroups: t.Definition.SecurityGroups,
-	})
+	ecstask, err := f.runTask(ctx, d)
 	if err != nil {
 		return nil, err
 	}
@@ -209,61 +193,61 @@ func (f *Fargate) Spawn(ctx context.Context, r io.Reader) (*spawner.World, error
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 		defer cancel()
 
-		f.StopTask(ctx, t.Definition.Cluster, *task.TaskArn)
+		f.stopTask(ctx, d.Cluster, ecstask.TaskArn)
 	}()
 
-	if task, err = f.waitRunningTask(ctx, t.Definition.Cluster, *task.TaskArn); err != nil {
+	if ecstask, err = f.waitRunningTask(ctx, d.Cluster, ecstask.TaskArn); err != nil {
 		return nil, err
 	}
 
-	eni, err := eniFromTask(task)
+	eni, err := eniFromTask(ecstask)
 	if err != nil {
 		return nil, err
 	}
-	ifi, err := describeNetworkInterface(ctx, f.lazySession(), eni)
+	ifi, err := describeNetworkInterface(ctx, f.sess, eni)
 	if err != nil {
 		return nil, err
 	}
 
-	addr := net.JoinHostPort(*ifi.Association.PublicIp, t.Definition.Service)
-	id := *task.TaskArn
+	task := Task{
+		Arn:     ecstask.TaskArn,
+		Addr:    ifi.Association.PublicIp,
+		Cluster: d.Cluster,
+	}
 
-	c := &Container{Addr: addr, Arn: id, Cluster: t.Definition.Cluster}
 	var b bytes.Buffer
-	if err := json.NewEncoder(&b).Encode(c); err != nil {
+	if err := json.NewEncoder(&b).Encode(&task); err != nil {
 		return nil, err
-	}
-	w := &spawner.World{
-		Id:      id,
-		Addr:    addr,
-		Spawner: f.Name(),
-		Details: json.RawMessage(b.Bytes()),
 	}
 	undo = false
-
-	return w, nil
+	return &spawner.World{
+		Id:      *task.Arn,
+		Addr:    *task.Addr,
+		Spawner: f.Name(),
+		Details: json.RawMessage(b.Bytes()),
+	}, nil
 }
 
-func (f *Fargate) Name() string { return "ecs.fargate" }
-
-func (f *Fargate) Kill(ctx context.Context, w spawner.World) error {
-	var p Container
-	if err := json.Unmarshal(w.Details, &p); err != nil {
+func (f *Fargate) stopTask(ctx context.Context, cluster, arn *string) error {
+	input := &ecs.StopTaskInput{
+		Cluster: cluster,
+		Task:    arn,
+	}
+	if err := input.Validate(); err != nil {
 		return err
 	}
-	return f.StopTask(ctx, p.Cluster, p.Arn)
+	_, err := f.client.StopTaskWithContext(ctx, input)
+	return err
+}
+
+func (f *Fargate) Kill(ctx context.Context, w spawner.World) error {
+	var t Task
+	if err := json.Unmarshal(w.Details, &t); err != nil {
+		return err
+	}
+	return f.stopTask(ctx, t.Cluster, t.Arn)
 }
 
 func (f *Fargate) Ps(ctx context.Context) ([]spawner.World, error) {
 	return []spawner.World{}, fmt.Errorf("not implemented yet")
 }
-
-func stringPtrSlice(s []string) []*string {
-	dst := make([]*string, len(s))
-	for i := range s {
-		dst[i] = stringPtr(s[i])
-	}
-	return dst
-}
-
-func stringPtr(s string) *string { return &s }
