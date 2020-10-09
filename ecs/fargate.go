@@ -253,7 +253,7 @@ func (f *Fargate) Kill(ctx context.Context, w spawner.World) error {
 func (f *Fargate) listTasksPag(ctx context.Context, cluster, nextToken *string) ([]*ecs.Task, *string, error) {
 	resp, err := f.client.ListTasks(&ecs.ListTasksInput{
 		NextToken: nextToken,
-		Cluster: cluster,
+		Cluster:   cluster,
 	})
 	if err != nil {
 		return nil, nil, err

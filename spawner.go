@@ -27,5 +27,5 @@ type Spawner interface {
 	Ps(ctx context.Context, g string) ([]*World, error)
 }
 
-func DecodeWorld(w *World, r io.Reader) error         { return json.NewDecoder(r).Decode(w) }
+func DecodeWorld(w *World, r io.Reader) error          { return json.NewDecoder(r).Decode(w) }
 func EncodeWorlds(w io.Writer, worlds ...*World) error { return json.NewEncoder(w).Encode(worlds) }
