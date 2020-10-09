@@ -13,13 +13,14 @@ import (
 var (
 	v  = flag.Bool("v", false, "Print software version")
 	k  = flag.Bool("k", false, "Kill & purge a previously spawned world")
-	ps = flag.Bool("ps", false, "Ignore any input and list running worlds")
+	ps = flag.Bool("ps", false, "Ignore any input and list running worlds. Requires g flag")
+	g  = flag.String("g", "", "Specify galaxy domain")
 )
 
-var version = "N/A"
+var version = "v0.1.0"
 
 func exitErr(err error) {
-	fmt.Fprintf(os.Stderr, err.Error())
+	fmt.Fprintf(os.Stderr, "%v\n", err.Error())
 	os.Exit(1)
 }
 
@@ -47,9 +48,12 @@ func main() {
 			exitErr(err)
 		}
 	case *ps:
-		var worlds []spawner.World
+		if *g == "" {
+			exitErr(fmt.Errorf("ps requires g flag to be specified"))
+		}
+		var worlds []*spawner.World
 		var err error
-		if worlds, err = s.Ps(ctx); err != nil {
+		if worlds, err = s.Ps(ctx, *g); err != nil {
 			exitErr(err)
 		}
 		if err = spawner.EncodeWorlds(os.Stdout, worlds...); err != nil {
@@ -61,7 +65,7 @@ func main() {
 		if w, err = s.Spawn(ctx, os.Stdin); err != nil {
 			exitErr(err)
 		}
-		if err = spawner.EncodeWorlds(os.Stdout, *w); err != nil {
+		if err = spawner.EncodeWorlds(os.Stdout, w); err != nil {
 			exitErr(err)
 		}
 	}
