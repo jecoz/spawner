@@ -1,0 +1,24 @@
+{
+	"name": "video-encoder",
+	"cluster": "keepinmind",
+	"subnets": [
+		"subnet-1234",
+		"subnet-5678"
+	],
+	"security_groups": [
+		"sg-1234",
+		"sg-5678"
+	],
+	"Overrides": [
+		{
+			"name": "worker",
+			"command": [
+				"ffmpeg",
+				"-i",
+				"this",
+				"-o",
+				"that"
+			]
+		}
+	]
+}
