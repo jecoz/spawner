@@ -8,6 +8,7 @@ import (
 
 type World struct {
 	Id      string `json:"id"`
+	Galaxy  string `json:"galaxy"`
 	Addr    string `json:"addr"`
 	Spawner string `json:"spawner"`
 
@@ -22,9 +23,9 @@ type Spawner interface {
 	Spawn(ctx context.Context, r io.Reader) (*World, error)
 	// Kill stops & purges a previously spawned World.
 	Kill(ctx context.Context, w World) error
-	// Ps lists the currently running Worlds.
-	Ps(ctx context.Context) ([]World, error)
+	// Ps lists the currently running Worlds in the given Galaxy g.
+	Ps(ctx context.Context, g string) ([]*World, error)
 }
 
 func DecodeWorld(w *World, r io.Reader) error         { return json.NewDecoder(r).Decode(w) }
-func EncodeWorlds(w io.Writer, worlds ...World) error { return json.NewEncoder(w).Encode(w) }
+func EncodeWorlds(w io.Writer, worlds ...*World) error { return json.NewEncoder(w).Encode(worlds) }

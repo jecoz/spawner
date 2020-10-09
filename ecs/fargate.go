@@ -1,9 +1,7 @@
 package ecs
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"time"
@@ -57,6 +55,8 @@ func (f *Fargate) describeTask(ctx context.Context, cluster, arn *string) (*ecs.
 	return resp.Tasks[0], nil
 }
 
+func runningTask(t *ecs.Task) bool { return *t.LastStatus == ecs.DesiredStatusRunning }
+
 func (f *Fargate) waitRunningTask(ctx context.Context, cluster, arn *string) (task *ecs.Task, err error) {
 	// Stop when the context is invalidated or the response is no longer
 	// successfull. We're waiting a pending process to become running here,
@@ -69,7 +69,7 @@ func (f *Fargate) waitRunningTask(ctx context.Context, cluster, arn *string) (ta
 			if err != nil {
 				return
 			}
-			if *task.LastStatus == ecs.DesiredStatusRunning {
+			if runningTask(task) {
 				return
 			}
 			// TODO: we could log each time we retry.
@@ -172,9 +172,9 @@ func eniFromTask(task *ecs.Task) (*string, error) {
 }
 
 func (f *Fargate) Spawn(ctx context.Context, r io.Reader) (*spawner.World, error) {
-	var d TaskDefinition
-	if err := json.NewDecoder(r).Decode(&d); err != nil {
-		return nil, fmt.Errorf("decoding task: %w", err)
+	d, err := TaskDefinitionFrom(r)
+	if err != nil {
+		return nil, err
 	}
 	ecstask, err := f.runTask(ctx, d)
 	if err != nil {
@@ -193,14 +193,33 @@ func (f *Fargate) Spawn(ctx context.Context, r io.Reader) (*spawner.World, error
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 		defer cancel()
 
-		f.stopTask(ctx, d.Cluster, ecstask.TaskArn)
+		f.stopTask(ctx, ecstask.ClusterArn, ecstask.TaskArn)
 	}()
 
 	if ecstask, err = f.waitRunningTask(ctx, d.Cluster, ecstask.TaskArn); err != nil {
 		return nil, err
 	}
+	task, err := f.newTaskFrom(ctx, ecstask)
+	if err != nil {
+		return nil, err
+	}
+	addr, err := f.TaskAddr(ctx, ecstask)
+	if err != nil {
+		return nil, err
+	}
+	task.Addr = addr
+	return task.NewWorld(f.Name(), *d.Cluster)
+}
 
-	eni, err := eniFromTask(ecstask)
+func (f *Fargate) newTaskFrom(ctx context.Context, t *ecs.Task) (*Task, error) {
+	return &Task{
+		Arn:        t.TaskArn,
+		ClusterArn: t.ClusterArn,
+	}, nil
+}
+
+func (f *Fargate) TaskAddr(ctx context.Context, t *ecs.Task) (*string, error) {
+	eni, err := eniFromTask(t)
 	if err != nil {
 		return nil, err
 	}
@@ -208,24 +227,7 @@ func (f *Fargate) Spawn(ctx context.Context, r io.Reader) (*spawner.World, error
 	if err != nil {
 		return nil, err
 	}
-
-	task := Task{
-		Arn:     ecstask.TaskArn,
-		Addr:    ifi.Association.PublicIp,
-		Cluster: d.Cluster,
-	}
-
-	var b bytes.Buffer
-	if err := json.NewEncoder(&b).Encode(&task); err != nil {
-		return nil, err
-	}
-	undo = false
-	return &spawner.World{
-		Id:      *task.Arn,
-		Addr:    *task.Addr,
-		Spawner: f.Name(),
-		Details: json.RawMessage(b.Bytes()),
-	}, nil
+	return ifi.Association.PublicIp, nil
 }
 
 func (f *Fargate) stopTask(ctx context.Context, cluster, arn *string) error {
@@ -241,13 +243,72 @@ func (f *Fargate) stopTask(ctx context.Context, cluster, arn *string) error {
 }
 
 func (f *Fargate) Kill(ctx context.Context, w spawner.World) error {
-	var t Task
-	if err := json.Unmarshal(w.Details, &t); err != nil {
+	t, err := TaskFrom(&w)
+	if err != nil {
 		return err
 	}
-	return f.stopTask(ctx, t.Cluster, t.Arn)
+	return f.stopTask(ctx, t.ClusterArn, t.Arn)
 }
 
-func (f *Fargate) Ps(ctx context.Context) ([]spawner.World, error) {
-	return []spawner.World{}, fmt.Errorf("not implemented yet")
+func (f *Fargate) listTasksPag(ctx context.Context, cluster, nextToken *string) ([]*ecs.Task, *string, error) {
+	resp, err := f.client.ListTasks(&ecs.ListTasksInput{
+		NextToken: nextToken,
+		Cluster: cluster,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	tasks := make([]*ecs.Task, 0, len(resp.TaskArns))
+	for _, v := range resp.TaskArns {
+		task, err := f.describeTask(ctx, cluster, v)
+		if err != nil {
+			return nil, nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, resp.NextToken, nil
+}
+
+func (f *Fargate) listTasks(ctx context.Context, cluster *string) ([]*ecs.Task, error) {
+	tasks := []*ecs.Task{}
+	var nextToken *string
+	var newTasks []*ecs.Task
+	var err error
+	for {
+		newTasks, nextToken, err = f.listTasksPag(ctx, cluster, nextToken)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, newTasks...)
+		if nextToken == nil {
+			return tasks, nil
+		}
+	}
+}
+
+func (f *Fargate) Ps(ctx context.Context, g string) ([]*spawner.World, error) {
+	all, err := f.listTasks(ctx, &g)
+	if err != nil {
+		return nil, err
+	}
+	worlds := make([]*spawner.World, 0, len(all))
+	for _, v := range all {
+		if !runningTask(v) {
+			continue
+		}
+		task, err := f.newTaskFrom(ctx, v)
+		if err != nil {
+			return nil, err
+		}
+		if runningTask(v) {
+			addr, _ := f.TaskAddr(ctx, v)
+			task.Addr = addr
+		}
+		w, err := task.NewWorld(f.Name(), g)
+		if err != nil {
+			return nil, err
+		}
+		worlds = append(worlds, w)
+	}
+	return worlds, nil
 }

@@ -1,5 +1,14 @@
 package ecs
 
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+
+	"github.com/jecoz/spawner"
+)
+
 type ContainerOverride struct {
 	// Name of the container. Check your task definition on the AWS console
 	// to find it out.
@@ -34,11 +43,45 @@ type TaskDefinition struct {
 	// https://github.com/aws/aws-sdk-go/blob/v1.35.5/service/ecs/api.go#L18572-L18595
 }
 
+func TaskDefinitionFrom(r io.Reader) (TaskDefinition, error) {
+	var d TaskDefinition
+	if err := json.NewDecoder(r).Decode(&d); err != nil {
+		return d, fmt.Errorf("decode task definition: %w", err)
+	}
+	return d, nil
+}
+
 // Task contains the information required to contact or stop a running task.
 // Spawner callers have to store this information if the want to be able to
 // Kill the World.
 type Task struct {
-	Arn     *string `json:"arn"`
-	Cluster *string `json:"cluster"`
-	Addr    *string `json:"addr"`
+	Arn        *string `json:"arn"`
+	ClusterArn *string `json:"cluster_arn"`
+	Addr       *string `json:"addr"`
+}
+
+func (t *Task) NewWorld(creator, galaxy string) (*spawner.World, error) {
+	var b bytes.Buffer
+	if err := json.NewEncoder(&b).Encode(t); err != nil {
+		return nil, err
+	}
+	var addr string
+	if t.Addr != nil {
+		addr = *t.Addr
+	}
+	return &spawner.World{
+		Id:      *t.Arn,
+		Galaxy:  galaxy,
+		Addr:    addr,
+		Spawner: creator,
+		Details: json.RawMessage(b.Bytes()),
+	}, nil
+}
+
+func TaskFrom(w *spawner.World) (Task, error) {
+	var t Task
+	if err := json.Unmarshal(w.Details, &t); err != nil {
+		return t, fmt.Errorf("unmarshal world details: %w", err)
+	}
+	return t, nil
 }
