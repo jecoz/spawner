@@ -27,8 +27,7 @@ func main() {
 	flag.Parse()
 
 	var s spawner.Spawner
-	var err error
-	s = new(ecs.Fargate)
+	s = ecs.NewFargate(version)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -41,14 +40,15 @@ func main() {
 		fmt.Println(version)
 	case *k:
 		var w spawner.World
-		if err = spawner.DecodeWorld(&w, os.Stdin); err != nil {
+		if err := spawner.DecodeWorld(&w, os.Stdin); err != nil {
 			exitErr(err)
 		}
-		if err = s.Kill(ctx, w); err != nil {
+		if err := s.Kill(ctx, w); err != nil {
 			exitErr(err)
 		}
 	case *ps:
 		var worlds []spawner.World
+		var err error
 		if worlds, err = s.Ps(ctx); err != nil {
 			exitErr(err)
 		}
@@ -57,6 +57,7 @@ func main() {
 		}
 	default:
 		var w *spawner.World
+		var err error
 		if w, err = s.Spawn(ctx, os.Stdin); err != nil {
 			exitErr(err)
 		}
